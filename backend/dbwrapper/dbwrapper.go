@@ -4,7 +4,9 @@ package dbwrapper
 
 import (
 	"context"
+	"crypto/md5"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -105,6 +107,47 @@ type replicaInfo struct {
 	Status     string
 }
 
+// Directory represents a directory derived from file paths in the database
+type Directory struct {
+	fs     *Fs
+	remote string
+}
+
+// Fs returns the parent Fs
+func (d *Directory) Fs() fs.Info {
+	return d.fs
+}
+
+// String returns the name of the directory
+func (d *Directory) String() string {
+	return d.remote
+}
+
+// Remote returns the remote path
+func (d *Directory) Remote() string {
+	return d.remote
+}
+
+// ModTime returns the modification time (unknown for derived directories)
+func (d *Directory) ModTime(ctx context.Context) time.Time {
+	return time.Time{}
+}
+
+// Size returns the size (0 for directories)
+func (d *Directory) Size() int64 {
+	return 0
+}
+
+// Items returns the count of items in this directory (unknown)
+func (d *Directory) Items() int64 {
+	return -1
+}
+
+// ID returns the internal ID of this directory (empty for derived)
+func (d *Directory) ID() string {
+	return ""
+}
+
 // ------------------------------------------------------------
 // Fs implementation
 // ------------------------------------------------------------
@@ -143,19 +186,10 @@ func (f *Fs) Precision() time.Duration {
 
 // Hashes returns the supported hash types
 func (f *Fs) Hashes() hash.Set {
-	// Return intersection of all remote hash types
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	if len(f.remotes) == 0 {
-		return hash.Set(hash.None)
-	}
-	hashSet := f.remotes[0].Fs.Hashes()
-	for _, r := range f.remotes[1:] {
-		if r.Fs != nil {
-			hashSet = hashSet.Overlap(r.Fs.Hashes())
-		}
-	}
-	return hashSet
+	// Always support MD5 since we compute it locally during upload
+	// This ensures hash verification works even when underlying remotes
+	// don't return hashes (e.g., S3 multipart uploads)
+	return hash.NewHashSet(hash.MD5)
 }
 
 // Features returns the optional features of this Fs
@@ -176,8 +210,18 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, errors.New("dbwrapper: db_dsn is required")
 	}
 
+	// Ensure parseTime=true is in the DSN for proper time.Time scanning
+	dsn := opt.DbDSN
+	if !strings.Contains(dsn, "parseTime=") {
+		if strings.Contains(dsn, "?") {
+			dsn = dsn + "&parseTime=true"
+		} else {
+			dsn = dsn + "?parseTime=true"
+		}
+	}
+
 	// Initialize database connection with pooling
-	db, err := sql.Open("mysql", opt.DbDSN)
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("dbwrapper: failed to open database: %w", err)
 	}
@@ -299,130 +343,173 @@ func (f *Fs) getActiveRemotes() []*remoteInfo {
 	return remotes
 }
 
-// List the objects and directories in dir
+// List the objects and directories in dir from the database
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
-	// We need to list from one of the remotes
-	// For directories, we rely on the underlying remotes
-	remotes := f.getActiveRemotes()
-	if len(remotes) == 0 {
-		return nil, errors.New("no active remotes available")
+	// Build the full path prefix for querying
+	prefix := ""
+	if f.root != "" {
+		prefix = f.root
+		if dir != "" {
+			prefix = path.Join(f.root, dir)
+		}
+	} else {
+		prefix = dir
 	}
 
-	// Use the first available remote for listing
-	var entries fs.DirEntries
-	var listErr error
-	for _, r := range remotes {
-		if r.Fs == nil {
-			continue
-		}
-		entries, listErr = r.Fs.List(ctx, dir)
-		if listErr == nil {
-			break
-		}
-		if listErr != fs.ErrorDirNotFound {
-			fs.Debugf(f, "list failed on remote %q: %v", r.Name, listErr)
-		}
+	// Normalize prefix for DB query
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix = prefix + "/"
 	}
 
-	if listErr != nil {
-		return nil, listErr
+	// Query files from database that are in this directory
+	// We need to find:
+	// 1. Files that are direct children of this directory
+	// 2. Directories (derived from file paths that have subdirectories)
+	var query string
+	var args []interface{}
+
+	if prefix == "" {
+		// Root directory - find all files
+		query = `SELECT id, remote_path, size, hash, created_at FROM files`
+	} else {
+		// Specific directory - find files that start with this prefix
+		query = `SELECT id, remote_path, size, hash, created_at FROM files WHERE remote_path LIKE ?`
+		args = append(args, prefix+"%")
 	}
 
-	// Wrap the entries
+	rows, err := f.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query files: %w", err)
+	}
+	defer rows.Close()
+
 	var result fs.DirEntries
-	for _, entry := range entries {
-		switch e := entry.(type) {
-		case fs.Object:
-			// Wrap the object
+	seenDirs := make(map[string]bool)
+
+	for rows.Next() {
+		var fileID int64
+		var remotePath string
+		var size int64
+		var hashValue sql.NullString
+		var createdAt time.Time
+
+		if err := rows.Scan(&fileID, &remotePath, &size, &hashValue, &createdAt); err != nil {
+			return nil, fmt.Errorf("failed to scan file row: %w", err)
+		}
+
+		// Calculate the relative path from the listing directory
+		var relativePath string
+		if prefix == "" {
+			relativePath = remotePath
+		} else {
+			if !strings.HasPrefix(remotePath, prefix) {
+				continue
+			}
+			relativePath = strings.TrimPrefix(remotePath, prefix)
+		}
+
+		// Check if this is a direct child or in a subdirectory
+		parts := strings.SplitN(relativePath, "/", 2)
+		if len(parts) == 1 {
+			// Direct child file
+			remote := relativePath
+			if dir != "" {
+				remote = path.Join(dir, relativePath)
+			}
+
 			obj := &Object{
 				fs:      f,
-				remote:  e.Remote(),
-				size:    e.Size(),
-				modTime: e.ModTime(ctx),
+				remote:  remote,
+				size:    size,
+				modTime: createdAt,
+				fileID:  fileID,
 			}
+			if hashValue.Valid {
+				obj.hash = hashValue.String
+			}
+			// Load replicas for the object
+			obj.loadReplicas(ctx)
 			result = append(result, obj)
-		case fs.Directory:
-			// Pass through directories
-			result = append(result, e)
+		} else {
+			// File is in a subdirectory - record the directory
+			subDir := parts[0]
+			if !seenDirs[subDir] {
+				seenDirs[subDir] = true
+				dirRemote := subDir
+				if dir != "" {
+					dirRemote = path.Join(dir, subDir)
+				}
+				result = append(result, &Directory{
+					fs:     f,
+					remote: dirRemote,
+				})
+			}
 		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating file rows: %w", err)
 	}
 
 	return result, nil
 }
 
-// NewObject finds the Object at remote
+// NewObject finds the Object at remote from the database
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	// First, try to find the file in the database
+	// Find the file in the database only
 	fullPath := remote
 	if f.root != "" {
 		fullPath = path.Join(f.root, remote)
 	}
 
-	// Query file info and replicas from database
+	// Query file info from database
 	var fileID int64
 	var size int64
 	var hashValue sql.NullString
+	var createdAt time.Time
 	err := f.db.QueryRowContext(ctx, `
-		SELECT id, size, hash
+		SELECT id, size, hash, created_at
 		FROM files
 		WHERE remote_path = ?
-	`, fullPath).Scan(&fileID, &size, &hashValue)
+	`, fullPath).Scan(&fileID, &size, &hashValue, &createdAt)
 
-	if err != nil && err != sql.ErrNoRows {
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fs.ErrorObjectNotFound
+		}
 		return nil, fmt.Errorf("failed to query file: %w", err)
 	}
 
+	// File found in database
 	obj := &Object{
-		fs:     f,
-		remote: remote,
+		fs:      f,
+		remote:  remote,
+		fileID:  fileID,
+		size:    size,
+		modTime: createdAt,
+	}
+	if hashValue.Valid {
+		obj.hash = hashValue.String
 	}
 
-	if err == nil {
-		// File found in database
-		obj.fileID = fileID
-		obj.size = size
-		if hashValue.Valid {
-			obj.hash = hashValue.String
-		}
+	// Load replicas
+	if err := obj.loadReplicas(ctx); err != nil {
+		fs.Debugf(f, "failed to load replicas for %q: %v", remote, err)
+	}
 
-		// Load replicas
-		if err := obj.loadReplicas(ctx); err != nil {
-			fs.Debugf(f, "failed to load replicas for %q: %v", remote, err)
-		}
-
-		// Try to get modTime from one of the replicas
-		for _, replica := range obj.replicas {
-			remoteFs := f.getRemoteByID(replica.RemoteID)
-			if remoteFs != nil && remoteFs.Fs != nil {
-				childObj, err := remoteFs.Fs.NewObject(ctx, remote)
-				if err == nil {
-					obj.modTime = childObj.ModTime(ctx)
-					break
-				}
+	// Try to get a more accurate modTime from one of the replicas
+	for _, replica := range obj.replicas {
+		remoteFs := f.getRemoteByID(replica.RemoteID)
+		if remoteFs != nil && remoteFs.Fs != nil {
+			childObj, err := remoteFs.Fs.NewObject(ctx, remote)
+			if err == nil {
+				obj.modTime = childObj.ModTime(ctx)
+				break
 			}
 		}
-
-		return obj, nil
 	}
 
-	// File not in database, try to find it in remotes
-	remotes := f.getActiveRemotes()
-	for _, r := range remotes {
-		if r.Fs == nil {
-			continue
-		}
-		childObj, err := r.Fs.NewObject(ctx, remote)
-		if err == nil {
-			obj.size = childObj.Size()
-			obj.modTime = childObj.ModTime(ctx)
-			return obj, nil
-		}
-		if err != fs.ErrorObjectNotFound {
-			fs.Debugf(f, "NewObject failed on remote %q: %v", r.Name, err)
-		}
-	}
-
-	return nil, fs.ErrorObjectNotFound
+	return obj, nil
 }
 
 // getRemoteByID finds a remote by its database ID
@@ -469,6 +556,11 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	if err != nil {
 		return nil, fmt.Errorf("failed to read input: %w", err)
 	}
+
+	// Compute MD5 hash locally - this ensures we have a valid hash
+	// even when underlying remotes don't return one (e.g., S3 multipart uploads)
+	md5Hash := md5.Sum(data)
+	hashValue := hex.EncodeToString(md5Hash[:])
 
 	// Use errgroup for parallel uploads
 	g, gCtx := errgroup.WithContext(ctx)
@@ -530,12 +622,6 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Get hash if available
-	var hashValue string
-	if len(uploadedObjects) > 0 {
-		hashValue, _ = uploadedObjects[0].Hash(ctx, hash.MD5)
-	}
 
 	// Insert or update file record
 	result, err := tx.ExecContext(ctx, `
@@ -722,11 +808,38 @@ func (o *Object) Size() int64 {
 	return o.size
 }
 
-// Hash returns the hash of the object
+// Hash returns the hash of the object from replicas
 func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
+	// Check if this hash type is supported by the filesystem
+	if !o.fs.Hashes().Contains(ty) {
+		return "", hash.ErrUnsupported
+	}
+
+	// Return stored MD5 hash if available and requested
 	if ty == hash.MD5 && o.hash != "" {
 		return o.hash, nil
 	}
+
+	// Try to get the hash from replicas
+	for _, replica := range o.replicas {
+		remoteInfo := o.fs.getRemoteByID(replica.RemoteID)
+		if remoteInfo == nil || remoteInfo.Fs == nil {
+			continue
+		}
+		childObj, err := remoteInfo.Fs.NewObject(ctx, o.remote)
+		if err != nil {
+			continue
+		}
+		hashVal, err := childObj.Hash(ctx, ty)
+		if err == nil && hashVal != "" {
+			// Cache MD5 hash if we got one
+			if ty == hash.MD5 {
+				o.hash = hashVal
+			}
+			return hashVal, nil
+		}
+	}
+
 	return "", hash.ErrUnsupported
 }
 
@@ -751,70 +864,45 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 	return nil
 }
 
-// Open opens the object for reading with retry logic
+// Open opens the object for reading by choosing a replica from the database
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	// If we have replicas from the database, try them in order
-	if len(o.replicas) > 0 {
-		var lastErr error
-		for _, replica := range o.replicas {
-			remoteInfo := o.fs.getRemoteByID(replica.RemoteID)
-			if remoteInfo == nil || remoteInfo.Fs == nil {
-				continue
-			}
-
-			childObj, err := remoteInfo.Fs.NewObject(ctx, o.remote)
-			if err != nil {
-				fs.Debugf(o.fs, "failed to get object from remote %q: %v", replica.RemoteName, err)
-				lastErr = err
-				continue
-			}
-
-			rc, err := childObj.Open(ctx, options...)
-			if err != nil {
-				fs.Debugf(o.fs, "failed to open object from remote %q: %v", replica.RemoteName, err)
-				lastErr = err
-				continue
-			}
-
-			fs.Debugf(o.fs, "successfully opened %q from remote %q", o.remote, replica.RemoteName)
-			return rc, nil
-		}
-
-		if lastErr != nil {
-			return nil, fmt.Errorf("failed to open from any replica: %w", lastErr)
-		}
+	// Must have replicas from the database to read
+	if len(o.replicas) == 0 {
+		return nil, errors.New("no replicas available for this file")
 	}
 
-	// Fallback: try all active remotes
-	remotes := o.fs.getActiveRemotes()
+	// Try replicas in order (ordered by weight from loadReplicas)
 	var lastErr error
-	for _, r := range remotes {
-		if r.Fs == nil {
+	for _, replica := range o.replicas {
+		remoteInfo := o.fs.getRemoteByID(replica.RemoteID)
+		if remoteInfo == nil || remoteInfo.Fs == nil {
+			fs.Debugf(o.fs, "remote %q not available for replica", replica.RemoteName)
 			continue
 		}
 
-		childObj, err := r.Fs.NewObject(ctx, o.remote)
+		childObj, err := remoteInfo.Fs.NewObject(ctx, o.remote)
 		if err != nil {
+			fs.Debugf(o.fs, "failed to get object from remote %q: %v", replica.RemoteName, err)
 			lastErr = err
 			continue
 		}
 
 		rc, err := childObj.Open(ctx, options...)
 		if err != nil {
-			fs.Debugf(o.fs, "failed to open object from remote %q: %v", r.Name, err)
+			fs.Debugf(o.fs, "failed to open object from remote %q: %v", replica.RemoteName, err)
 			lastErr = err
 			continue
 		}
 
-		fs.Debugf(o.fs, "successfully opened %q from remote %q (fallback)", o.remote, r.Name)
+		fs.Debugf(o.fs, "successfully opened %q from replica on remote %q", o.remote, replica.RemoteName)
 		return rc, nil
 	}
 
 	if lastErr != nil {
-		return nil, fmt.Errorf("failed to open from any remote: %w", lastErr)
+		return nil, fmt.Errorf("failed to open from any replica: %w", lastErr)
 	}
 
-	return nil, fs.ErrorObjectNotFound
+	return nil, errors.New("no working replicas found")
 }
 
 // Update updates the object with new content
@@ -929,5 +1017,6 @@ func (w *objectInfoWrapper) Size() int64 {
 var (
 	_ fs.Fs         = (*Fs)(nil)
 	_ fs.Object     = (*Object)(nil)
+	_ fs.Directory  = (*Directory)(nil)
 	_ fs.Shutdowner = (*Fs)(nil)
 )
